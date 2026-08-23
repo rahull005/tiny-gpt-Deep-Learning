@@ -23,6 +23,8 @@ N_EMBD = 128
 N_HEAD = 4
 N_LAYER = 4
 
+DROPOUT_RATE = 0.1   # fraction of activations randomly zeroed during training (see note below)
+
 LEARNING_RATE = 3e-4
 
 MAX_STEPS = 5000
@@ -101,6 +103,14 @@ def decode(ids):
 print(f"Vocabulary size       : {vocab_size}")
 print(f"Characters             : {repr(''.join(chars))}")
 
+# Sanity check to keep in mind while training: a completely untrained model,
+# guessing uniformly at random over `vocab_size` classes, has expected
+# cross-entropy loss = -log(1/vocab_size) = log(vocab_size).
+# e.g. for vocab_size=65, that's ln(65) ~= 4.17.
+# Your very first printed training loss should land close to this number —
+# if it doesn't, something in the loss/logits wiring is likely broken.
+print(f"Expected loss at init (ln(vocab_size)) : {np.log(vocab_size):.4f}")
+
 
 # ============================================================
 # 5. CONVERT TEXT TO TOKEN IDs
@@ -138,7 +148,10 @@ def get_batch(split):
         x = abcde
         y = bcdef
 
-    The model learns next-token prediction.
+    The model learns next-token prediction: at every position t,
+    x[t] is context and y[t] is the correct next character. Every
+    position in the block is trained simultaneously (not one at a time),
+    which is what makes transformer training parallelizable.
     """
 
     dataset = (
@@ -198,25 +211,32 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
 
         self.head_size = n_embd // n_head
 
-        # Q projection
+        # Q projection: "what is this token looking for in other tokens?"
         self.Wq = tf.keras.layers.Dense(
             n_embd,
             use_bias=False
         )
 
-        # K projection
+        # K projection: "what does this token contain/advertise?"
+        # Q and K live in the same space so their dot product is a
+        # meaningful similarity/relevance score.
         self.Wk = tf.keras.layers.Dense(
             n_embd,
             use_bias=False
         )
 
-        # V projection
+        # V projection: "what information does this token actually pass on
+        # if it gets picked?" — deliberately a SEPARATE space from Q/K,
+        # because "how relevant am I" and "what do I contribute" are
+        # different questions.
         self.Wv = tf.keras.layers.Dense(
             n_embd,
             use_bias=False
         )
 
-        # Output projection
+        # Output projection: after concatenating all heads back together,
+        # this lets the model mix/recombine information ACROSS heads
+        # (each head only saw its own slice of the embedding until now).
         self.Wo = tf.keras.layers.Dense(
             n_embd,
             use_bias=False
@@ -232,6 +252,11 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         Output:
 
             (B, H, T, HS)
+
+        Splitting into H heads of size HS = C/H lets the model learn several
+        INDEPENDENT relevance patterns in parallel (e.g. one head tracks
+        "the previous word", another tracks "the subject of the sentence"),
+        instead of being forced to learn one single attention pattern.
         """
 
         shape = tf.shape(x)
@@ -285,6 +310,10 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         # Attention scores
         #
         # Q @ K^T
+        #
+        # scores[i, j] = dot product of query i with key j = how much
+        # token i should attend to token j. Large positive dot product
+        # -> vectors point the same direction -> "relevant".
         # ----------------------------------------------------
 
         scores = tf.matmul(
@@ -297,6 +326,15 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         # Scaling
         #
         # divide by sqrt(head_size)
+        #
+        # WHY: Q.K is a sum of head_size independent terms, each with some
+        # variance v. The variance of the SUM grows linearly with head_size,
+        # so its standard deviation grows with sqrt(head_size). Without
+        # correcting for this, larger head_size -> larger-magnitude scores
+        # -> softmax saturates into a near one-hot distribution -> gradients
+        # through softmax vanish almost everywhere. Dividing by sqrt(head_size)
+        # keeps the scores' scale roughly independent of head_size, so
+        # softmax starts in its "sensitive" (well-behaved gradient) regime.
         # ----------------------------------------------------
 
         scale = tf.sqrt(
@@ -310,6 +348,12 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
 
         # ----------------------------------------------------
         # Causal mask
+        #
+        # A GPT predicts the next token, so token t must NEVER be allowed
+        # to see tokens > t (that would be cheating — peeking at the answer
+        # during training). We enforce this by setting disallowed positions'
+        # score to -infinity BEFORE softmax, so softmax assigns them
+        # probability e^(-inf) = 0.
         # ----------------------------------------------------
 
         mask = tf.linalg.band_part(
@@ -333,6 +377,11 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
 
         # ----------------------------------------------------
         # Softmax
+        #
+        # Converts raw scores into a probability distribution over "which
+        # positions to attend to" — every row sums to exactly 1. This turns
+        # attention into a weighted AVERAGE (a convex combination) of the
+        # Value vectors, rather than an arbitrary linear combination.
         # ----------------------------------------------------
 
         attention_weights = tf.nn.softmax(
@@ -342,6 +391,10 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
 
         # ----------------------------------------------------
         # Weighted sum of V
+        #
+        # output[i] = sum_j( attention_weights[i,j] * V[j] )
+        # i.e. "blend together the Values of every token, weighted by how
+        # relevant each one is to token i".
         # ----------------------------------------------------
 
         head_output = tf.matmul(
@@ -389,8 +442,19 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
 # ============================================================
 
 class FeedForward(tf.keras.layers.Layer):
+    """
+    Attention lets tokens exchange information with each other.
+    FeedForward is the complementary step: each token, independently,
+    "thinks about" what it just gathered. It's applied identically and
+    separately to every position (no cross-token mixing happens here).
 
-    def __init__(self, n_embd):
+    Expanding to 4x width then projecting back down (n_embd -> 4*n_embd ->
+    n_embd) gives the network a wider intermediate space to compute in —
+    empirically this ~4x ratio is what the original Transformer/GPT papers
+    settled on; it's a capacity/compute tradeoff, not a hard requirement.
+    """
+
+    def __init__(self, n_embd, dropout_rate=0.1):
 
         super().__init__()
 
@@ -403,12 +467,37 @@ class FeedForward(tf.keras.layers.Layer):
 
             tf.keras.layers.Dense(
                 n_embd
-            )
+            ),
+
+            # ------------------------------------------------
+            # DROPOUT (regularization to fight overfitting)
+            #
+            # MATH INTUITION: during training, each unit is independently
+            # zeroed out with probability `dropout_rate`, and the surviving
+            # units are scaled by 1/(1 - dropout_rate) ("inverted dropout")
+            # so the expected sum of activations stays the same whether or
+            # not dropout is applied. This means:
+            #   E[output_with_dropout] == E[output_without_dropout]
+            # so downstream layers see a signal of the same expected
+            # magnitude at train and test time.
+            #
+            # WHY THIS FIGHTS OVERFITTING: a unit can no longer count on any
+            # specific OTHER unit being present on a given forward pass
+            # (it might be dropped). This discourages the network from
+            # building brittle, co-adapted pathways that only work for
+            # exact training examples — it's forced toward more redundant,
+            # generalizable representations. This is mathematically similar
+            # to training an ensemble of many thinned sub-networks and
+            # implicitly averaging over them.
+            #
+            # At inference (training=False), dropout is simply the identity
+            # function — all units are used, nothing is zeroed or rescaled.
+            # ------------------------------------------------
+            tf.keras.layers.Dropout(dropout_rate),
         ])
 
-    def call(self, x):
-
-        return self.net(x)
+    def call(self, x, training=False):
+        return self.net(x, training=training)
 
 
 # ============================================================
@@ -416,11 +505,34 @@ class FeedForward(tf.keras.layers.Layer):
 # ============================================================
 
 class TransformerBlock(tf.keras.layers.Layer):
+    """
+    Pre-norm residual architecture (same as GPT-2 onward):
+
+        x = x + Dropout(Attention(LayerNorm(x)))
+        x = x + FeedForward(LayerNorm(x))          (dropout lives inside FeedForward)
+
+    RESIDUAL CONNECTION MATH INTUITION:
+    For y = x + f(x), the gradient of any downstream loss L w.r.t. x is:
+        dL/dx = dL/dy * dy/dx = dL/dy * (1 + df/dx)
+    That "+1" term means gradient always has a direct, unattenuated path
+    back to x, no matter how small or poorly-scaled df/dx is. Stack many
+    such blocks and gradients can still reach the earliest layers instead
+    of vanishing — this is precisely why deep transformers are trainable
+    at all.
+
+    PRE-NORM (LayerNorm INSIDE the residual branch, not after the addition)
+    intuition: it keeps the "residual stream" x accumulating raw, unscaled
+    updates across all layers, while each sublayer gets a nicely-normalized
+    view of x to compute from. Post-norm (original 2017 Transformer paper)
+    is more sensitive to initialization and requires learning-rate warmup;
+    pre-norm is what made very deep transformers practical to train.
+    """
 
     def __init__(
         self,
         n_embd,
-        n_head
+        n_head,
+        dropout_rate=0.1
     ):
 
         super().__init__()
@@ -435,39 +547,54 @@ class TransformerBlock(tf.keras.layers.Layer):
             n_head
         )
 
+        # ------------------------------------------------
+        # Dropout applied to the ATTENTION SUB-LAYER'S OUTPUT, before it's
+        # added back into the residual stream. Same inverted-dropout math
+        # as in FeedForward: zero a random subset of the attention output's
+        # channels each step, rescale survivors, so the network can't rely
+        # on any single attention "route" always being present.
+        # ------------------------------------------------
+        self.attn_dropout = tf.keras.layers.Dropout(dropout_rate)
+
         self.ln2 = tf.keras.layers.LayerNormalization(
             epsilon=1e-5
         )
 
         self.feed_forward = FeedForward(
-            n_embd
+            n_embd,
+            dropout_rate
         )
 
-    def call(self, x):
+    def call(self, x, training=False):
 
         # ----------------------------------------------------
         # Attention sub-layer
         #
-        # x -> LayerNorm -> Attention -> Residual
+        # x -> LayerNorm -> Attention -> Dropout -> Residual add
         # ----------------------------------------------------
 
-        x = (
-            x
-            + self.attention(
-                self.ln1(x)
-            )
+        attn_out = self.attention(
+            self.ln1(x)
         )
+
+        attn_out = self.attn_dropout(
+            attn_out,
+            training=training
+        )
+
+        x = x + attn_out
 
         # ----------------------------------------------------
         # Feed-forward sub-layer
         #
-        # x -> LayerNorm -> FFN -> Residual
+        # x -> LayerNorm -> FFN (dropout inside) -> Residual add
         # ----------------------------------------------------
 
         x = (
             x
             + self.feed_forward(
-                self.ln2(x)
+                self.ln2(x),
+                training=training
             )
         )
 
@@ -486,7 +613,8 @@ class TinyGPT(tf.keras.Model):
         block_size,
         n_embd,
         n_head,
-        n_layer
+        n_layer,
+        dropout_rate=0.1
     ):
 
         super().__init__()
@@ -495,6 +623,11 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Token embedding
+        #
+        # A lookup table: row i is a learned n_embd-dimensional vector
+        # representing "what token i means". The model never sees the raw
+        # integer id directly past this point — everything downstream
+        # operates on this dense vector.
         # ----------------------------------------------------
 
         self.token_embedding = tf.keras.layers.Embedding(
@@ -504,6 +637,12 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Position embedding
+        #
+        # Attention itself is permutation-invariant (it treats the input as
+        # a SET of tokens, not a SEQUENCE — nothing about Q.K@V cares about
+        # order). Positional embeddings are how we inject "where in the
+        # sequence am I" back in, by adding a learned vector per position
+        # index to each token's embedding.
         # ----------------------------------------------------
 
         self.position_embedding = tf.keras.layers.Embedding(
@@ -519,7 +658,8 @@ class TinyGPT(tf.keras.Model):
 
             TransformerBlock(
                 n_embd,
-                n_head
+                n_head,
+                dropout_rate
             )
 
             for _ in range(n_layer)
@@ -527,6 +667,10 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Final normalization
+        #
+        # One last LayerNorm before the output head, so the final
+        # representation fed into lm_head has stable, consistent scale
+        # regardless of how it drifted across n_layer blocks.
         # ----------------------------------------------------
 
         self.final_ln = tf.keras.layers.LayerNormalization(
@@ -535,13 +679,18 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Language model head
+        #
+        # Projects each position's n_embd-dim vector to vocab_size raw
+        # scores ("logits") — one score per possible next character.
+        # These are NOT probabilities yet; softmax (inside the loss
+        # function or during generation) turns them into a distribution.
         # ----------------------------------------------------
 
         self.lm_head = tf.keras.layers.Dense(
             vocab_size
         )
 
-    def call(self, idx):
+    def call(self, idx, training=False):
 
         # ----------------------------------------------------
         # Sequence length
@@ -569,6 +718,11 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Combine token + position
+        #
+        # Simple element-wise addition fuses "identity" and "location" into
+        # one vector. Broadcasting handles the fact that token_embeddings
+        # is (B,T,C) while position_embeddings is (T,C) — the same position
+        # vector is added to every sequence in the batch.
         # ----------------------------------------------------
 
         x = (
@@ -578,11 +732,16 @@ class TinyGPT(tf.keras.Model):
 
         # ----------------------------------------------------
         # Transformer blocks
+        #
+        # `training` is threaded through every block so Dropout layers
+        # know whether to actually drop units (training=True) or act as
+        # the identity function (training=False, e.g. during evaluation
+        # or text generation).
         # ----------------------------------------------------
 
         for block in self.blocks:
 
-            x = block(x)
+            x = block(x, training=training)
 
         # ----------------------------------------------------
         # Final LayerNorm
@@ -608,7 +767,8 @@ model = TinyGPT(
     block_size=BLOCK_SIZE,
     n_embd=N_EMBD,
     n_head=N_HEAD,
-    n_layer=N_LAYER
+    n_layer=N_LAYER,
+    dropout_rate=DROPOUT_RATE
 )
 
 
@@ -624,7 +784,7 @@ dummy_input = tf.zeros(
     dtype=tf.int32
 )
 
-_ = model(dummy_input)
+_ = model(dummy_input, training=False)
 
 
 # ============================================================
@@ -643,6 +803,13 @@ model.summary()
 # 15. LOSS FUNCTION
 # ============================================================
 
+# SparseCategoricalCrossentropy(from_logits=True) internally does:
+#   1. softmax(logits)  -> turns raw scores into a probability distribution
+#   2. -log(prob assigned to the TRUE next token)
+# Minimizing this pushes the model to assign higher and higher probability
+# to whatever character actually came next in the real text. Using
+# from_logits=True (rather than pre-computing softmax yourself) is both
+# more numerically stable and slightly faster, since TF fuses the two ops.
 loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True
 )
@@ -652,6 +819,13 @@ loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
 # 16. OPTIMIZER
 # ============================================================
 
+# Adam maintains, per parameter: a running average of the gradient (like
+# momentum -> smooths out noisy gradient estimates from mini-batches) and
+# a running average of the SQUARED gradient (-> gives each parameter its
+# own adaptive step size: parameters with consistently large gradients get
+# smaller effective steps, and vice versa). This combination is why Adam
+# tends to converge faster and more reliably than plain SGD, especially
+# for transformers.
 optimizer = tf.keras.optimizers.Adam(
     learning_rate=LEARNING_RATE
 )
@@ -666,13 +840,17 @@ def train_step(xb, yb):
 
     # --------------------------------------------------------
     # Forward pass
+    #
+    # GradientTape RECORDS every differentiable operation performed
+    # inside this block (every matmul, add, softmax, etc. across all
+    # n_layer blocks). It builds a computation graph on the fly.
     # --------------------------------------------------------
 
     with tf.GradientTape() as tape:
 
         logits = model(
             xb,
-            training=True
+            training=True   # dropout IS active here
         )
 
         # ----------------------------------------------------
@@ -686,6 +864,13 @@ def train_step(xb, yb):
 
     # --------------------------------------------------------
     # Backpropagation
+    #
+    # tape.gradient walks the recorded graph BACKWARD from `loss`,
+    # applying the chain rule automatically at every recorded op, to
+    # compute d(loss)/d(every trainable variable) in one pass. This is
+    # exactly what you'd get if you derived and coded every layer's
+    # backward formula by hand (as in a from-scratch NumPy version) —
+    # here the framework does it for you.
     # --------------------------------------------------------
 
     gradients = tape.gradient(
@@ -695,6 +880,10 @@ def train_step(xb, yb):
 
     # --------------------------------------------------------
     # Update weights
+    #
+    # Each variable moves a small step in the direction that REDUCES the
+    # loss the fastest (negative gradient direction), with Adam's adaptive
+    # per-parameter scaling applied to that step.
     # --------------------------------------------------------
 
     optimizer.apply_gradients(
@@ -713,7 +902,9 @@ def train_step(xb, yb):
 
 def evaluate():
 
-    # We don't need gradients while evaluating.
+    # We don't need gradients while evaluating, and critically we pass
+    # training=False so Dropout is OFF — we want to measure the model's
+    # true, full-capacity performance, not a noisy dropped-out version.
 
     xb, yb = get_batch("train")
 
@@ -755,6 +946,13 @@ def generate(
     max_new_tokens=300,
     temperature=0.8
 ):
+    """
+    Autoregressive generation: predict ONE next token, append it to the
+    sequence, then feed the (now longer) sequence back in and repeat.
+    This loop is identical in spirit to how any GPT-style model generates
+    text — always one token at a time, always conditioned on everything
+    generated so far (up to the context window limit).
+    """
 
     # --------------------------------------------------------
     # Encode starting text
@@ -775,6 +973,10 @@ def generate(
 
         # ----------------------------------------------------
         # Keep only the latest context window
+        #
+        # The model has a position embedding table of size BLOCK_SIZE —
+        # it mathematically CANNOT be given more than BLOCK_SIZE tokens
+        # of context, so we crop.
         # ----------------------------------------------------
 
         idx_cond = idx[
@@ -784,6 +986,9 @@ def generate(
 
         # ----------------------------------------------------
         # Model prediction
+        #
+        # training=False -> dropout off, deterministic use of the full
+        # trained network (no random zeroing during generation).
         # ----------------------------------------------------
 
         logits = model(
@@ -796,6 +1001,10 @@ def generate(
 
         # ----------------------------------------------------
         # Only the final position matters
+        #
+        # logits has shape (B,T,vocab_size) — a next-token prediction for
+        # EVERY position, but we only care about predicting what comes
+        # after the very last token we currently have.
         # ----------------------------------------------------
 
         logits_last = logits[
@@ -806,6 +1015,13 @@ def generate(
 
         # ----------------------------------------------------
         # Temperature
+        #
+        # Dividing logits by T before softmax: softmax(z/T).
+        # T < 1 exaggerates differences between logits -> sharper,
+        #        more confident, more repetitive/deterministic distribution.
+        # T > 1 shrinks differences between logits -> flatter, more
+        #        uniform -> more randomness/novelty, more mistakes.
+        # T = 1 uses the model's logits exactly as learned.
         # ----------------------------------------------------
 
         logits_last = (
@@ -824,6 +1040,10 @@ def generate(
 
         # ----------------------------------------------------
         # Sample next token
+        #
+        # Sampling (rather than always taking argmax) draws from the full
+        # learned distribution, so the same prompt can produce different
+        # continuations — this is what gives generated text variety.
         # ----------------------------------------------------
 
         next_token = np.array([
